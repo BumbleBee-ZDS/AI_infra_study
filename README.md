@@ -46,6 +46,16 @@ python main.py
 > 一个都不装也能跑：限流走进程内计数，历史写 `logs/gateway.db`（SQLite），事件直接写
 > `logs/events.jsonl`。启动日志会打印实际生效的后端。
 
+方式四（多实例 + nginx 负载均衡，扩容姿势）：
+
+```bash
+bash scripts/nginx.sh install      # 首次：免 root 解包 nginx
+bash scripts/cluster.sh start      # 3 个实例(8000/8001/8002) + nginx 入口 :8080
+bash scripts/cluster.sh scale 5    # 扩到 5 个（热加载，不断连接）
+```
+
+（详见「多实例部署 + nginx 负载均衡」。）
+
 > 需要本机已运行 Ollama（默认 `http://localhost:11434`，可用 `OLLAMA_URL` 覆盖），
 > 且已拉取模型，例如：`ollama pull qwen2.5:0.5b`。
 
@@ -187,11 +197,15 @@ prometheus_metrics.py       # 指标定义与记录辅助函数
 metrics.py / logger.py      # GPU 采样 / JSONL 文件日志
 tuning_experiment.py        # Ollama 参数调优扫描实验
 verify_infra.py             # 基础设施验收（双实例限流对照 + 历史 + 事件）
-study.md                    # 从零上手学习手册（分 10 个阶段 + 12 道练习 + 附录）
+verify_cluster.py           # 多实例 + nginx 负载均衡验收（含故障转移）
+study.md                    # 从零上手学习手册（分 11 个阶段 + 12 道练习 + 附录）
 scripts/infra.sh            # Redis / PostgreSQL / Kafka 免 root 本地部署
+scripts/cluster.sh          # 多实例网关集群（start / scale / status / logs）
+scripts/nginx.sh            # nginx 负载均衡层（install / start / reload / status）
+nginx/nginx.conf.tpl        # 负载均衡配置模板（由 scripts/nginx.sh 渲染）
 scripts/install_monitoring.sh, scripts/monitoring.sh    # Prometheus + Grafana
 monitoring/                 # Prometheus 抓取配置 + Grafana 仪表盘与 provisioning
-logs/                       # gateway.log / gateway.db / events.jsonl / 实验输出
+logs/                       # gateway.log / gateway.db / events.jsonl / cluster/ / 实验输出
 ```
 
 ## 监控（Prometheus + Grafana）
@@ -201,7 +215,7 @@ logs/                       # gateway.log / gateway.db / events.jsonl / 实验�
 
 ```
 monitoring/
-├── prometheus.yml                                  # 抓取配置
+├── prometheus.yml                                  # 抓取配置（targets 由 GATEWAY_TARGETS 渲染）
 └── grafana/
     ├── dashboards/llm-gateway.json                 # 仪表盘（35 个面板 / 5 个行）
     └── provisioning/
@@ -209,7 +223,9 @@ monitoring/
         └── dashboards/dashboards.yml.tpl           # 仪表盘自动加载（启动时渲染绝对路径）
 scripts/
 ├── install_monitoring.sh                           # 下载并解压 Prometheus / Grafana
-└── monitoring.sh                                   # start / stop / restart / status / logs
+└── monitoring.sh                                   # start / stop / restart / status / logs / targets / reload
+nginx/
+└── nginx.conf.tpl                                  # nginx 负载均衡模板（由 scripts/nginx.sh 渲染）
 ```
 
 ### 首次安装
@@ -226,11 +242,17 @@ bash scripts/monitoring.sh start      # 启动 Prometheus + Grafana
 bash scripts/monitoring.sh status
 bash scripts/monitoring.sh logs
 bash scripts/monitoring.sh stop
+bash scripts/monitoring.sh targets    # 看渲染出的抓取目标 + 当前状态
+bash scripts/monitoring.sh reload     # 改了 GATEWAY_TARGETS 后热加载
 ```
+
+抓取目标由 `GATEWAY_TARGETS`（逗号分隔）渲染，默认单实例 `localhost:8000`；
+多实例集群写成 `GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002` 即可
+（详见下方「多实例部署 + nginx 负载均衡」）。
 
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| 网关指标 | http://localhost:8000/metrics | 被抓取端点 |
+| 网关指标 | http://localhost:8000/metrics | 被抓取端点（集群时每个实例各一个） |
 | Prometheus | http://localhost:9090 | 抓取目标：http://localhost:9090/targets |
 | Grafana | http://localhost:3000 | 匿名只读可看，登录 `admin` / `admin` |
 | 仪表盘 | http://localhost:3000/d/llm-gateway | 「LLM Gateway 监控」 |
@@ -441,6 +463,96 @@ python verify_infra.py --skip-kafka        # 只验限流与历史
 脚本会自己拉起两个网关实例（`:8000` / `:8001`）跑上面那张对照表，再检查 `/history`、
 `/history/stats`、直连数据库的行数、Kafka 事件类型分布，最后打印 `验收结果: 21/21 项通过`。
 （脚本读 `DATABASE_URL` / `REDIS_URL` / `KAFKA_BOOTSTRAP` 环境变量，也可用命令行参数覆盖。）
+
+## 多实例部署 + nginx 负载均衡
+
+单实例撑不住时，网关可以直接水平扩——**进程本身无状态**，状态都在外部组件里：
+限流额度在 Redis、请求历史在 PostgreSQL、事件在 Kafka，所以多起几个进程就是多份并发。
+
+```
+                        ┌───────────────────┐
+   客户端 ───────────▶  │   nginx  :8080    │  least_conn + 被动健康检查
+                        └─────────┬─────────┘
+              ┌───────────────────┼───────────────────┐
+        ┌─────▼─────┐       ┌─────▼─────┐       ┌─────▼─────┐
+        │  :8000    │       │  :8001    │       │  :8002    │  同一份代码，
+        │gateway-8000      │gateway-8001      │gateway-8002     仅端口/实例名/日志不同
+        └─────┬─────┘       └─────┬─────┘       └─────┬─────┘
+              └───────────────────┼───────────────────┘
+        ┌──────────────┐  ┌───────▼────────┐  ┌──────────────┐
+        │ Redis 限流   │  │ PostgreSQL 历史 │  │ Kafka 事件   │
+        └──────────────┘  └────────────────┘  └──────────────┘
+              ▲ 每个实例各自暴露 /metrics —— Prometheus 直连抓取（不经过 nginx）
+```
+
+### 一键起停
+
+```bash
+bash scripts/nginx.sh install          # 首次：免 root 解包 nginx 到 ~/opt/nginx
+bash scripts/cluster.sh start          # 起 3 个实例(8000/8001/8002) 并接上 nginx(8080)
+bash scripts/cluster.sh status         # 实例健康 + nginx 上游 + 经 LB 的分发采样
+bash scripts/cluster.sh scale 5        # 扩到 5 个：先起新实例，再 reload nginx
+bash scripts/cluster.sh scale 3        # 缩容：先改上游并 reload，再优雅停实例
+bash scripts/cluster.sh logs           # 各实例日志 + nginx 访问日志
+bash scripts/cluster.sh stop
+```
+
+统一入口 `http://localhost:8080`（`/lb-health` 是 nginx 自己的健康端点）。
+`curl -i` 看响应头 `x-gateway-instance: gateway-8001` 就知道这次落在哪个实例。
+
+### 观测：多实例怎么抓
+
+每个实例各自暴露 `/metrics`，Prometheus **直连各实例**（同一个 job 多 target，Grafana 看板无需改动）：
+
+```bash
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh start
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh reload
+bash scripts/monitoring.sh targets     # 只看渲染出的抓取配置与 target 状态
+```
+
+- 经 nginx 抓 `/metrics` 会被 **明确拒绝（404）**：否则所有实例的样本 `instance` 标签都会变成
+  LB 地址，分不清是哪个实例、也看不出「某个实例挂了」；
+- 限流是跨实例共享的：free 档经 LB 连发 12 次，3 个实例合计只放行 10 次。
+
+### 验收
+
+```bash
+python verify_cluster.py               # 34 项检查，约 1 分钟
+```
+
+脚本临时拉起 3 个实例（`:8100~:8102`）+ 一个独立前缀的 nginx（`:8180`，不影响你跑的 8080），
+验证分发、SSE 未被缓冲、共享限流、多实例写历史、**杀一个实例看自动摘除与恢复**、观测隔离等。
+
+### nginx 配置要点（`nginx/nginx.conf.tpl`）
+
+| 指令 | 值 | 为什么 |
+|------|-----|--------|
+| `least_conn` | — | LLM 单请求耗时长，按当前连接数分发比轮询更均衡 |
+| `max_fails` / `fail_timeout` | `2` / `10s` | 实例挂了自动摘除，10s 后再试；恢复即自动加回 |
+| `proxy_buffering` | `off` | **SSE 必须关**，否则逐字输出变成「憋几秒一次吐出」 |
+| `proxy_http_version` + `Connection ""` + `keepalive 32` | 1.1 / 空 | 三行齐写才能与上游复用长连接 |
+| `proxy_read_timeout` | `300s` | 默认 60s 会把长回答掐断 |
+| `proxy_connect_timeout` | `2s` | 死实例快速失败，交给下一个上游 |
+| `proxy_next_upstream` | `error timeout` | 连接阶段失败才换机；POST 非幂等默认不重试，避免重复生成 |
+
+配置由 `scripts/nginx.sh` 从模板渲染（端口 / 上游列表 / 日志目录），改完用
+`bash scripts/cluster.sh scale <N>` 或 `bash scripts/nginx.sh reload` 平滑生效（不中断连接）。
+
+### 实测结果（本机 GTX 1050 Ti）
+
+| 验证项 | 结果 |
+|--------|------|
+| 12 次请求经 LB 的分发 | `{8000: 4, 8001: 4, 8002: 4}` |
+| 9 次真实请求后 Prometheus 各实例计数 | `localhost:8001=4, localhost:8000=4, localhost:8002=3` |
+| 流式经 LB 首字节 / 总时长 | 0.033s / 0.724s（直连 0.033s / 0.155s → 未被缓冲） |
+| 杀掉一个实例 | 客户端仍全部 200；访问日志 `"upstream_addr":"127.0.0.1:8100, 127.0.0.1:8101"`、`"upstream_status":"502, 200"` 即自动换机；`nginx-error.log` 记录 `connect() failed` / `temporarily disabled` |
+| 实例恢复 | 10s 内（`fail_timeout`）自动加回上游，无需 reload |
+| free 档经 LB 连发 12 次 | `200×10 + 429×2`（3 个实例共享额度） |
+| `verify_cluster.py` | `34/34 项通过` |
+
+> 单机多实例扩的是「网关层」的并发与可用性；真正的瓶颈通常在 Ollama（只有一块 GPU，
+> 请求最终仍排同一个队列）。把 `OLLAMA_URL` 指向多台 Ollama / 再加一层调度，
+> 才能让水平扩容真正生效——**负载均衡能消除瓶颈，不能创造算力**。
 
 ## Ollama 参数调优实验（GTX 1050 Ti）
 

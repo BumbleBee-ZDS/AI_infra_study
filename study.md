@@ -25,11 +25,12 @@
 | 8 | 降级演练（最值得学的一章） | 60 分钟 |
 | 9 | 自动化验收、压测、参数调优 | 60 分钟 |
 | 10 | 12 道进阶动手题 | 按需 |
+| 11 | 多实例部署 + nginx 负载均衡（含故障转移） | 90 分钟 |
 | 附录 A | 命令速查 | 随时查 |
 | 附录 B | 文件地图（改代码前先看） | 随时查 |
 | 附录 C | 报错对照表 | 随时查 |
 | 附录 D | 术语表 | 随时查 |
-| 附录 E | 自测题 15 问 + 打卡表 | 复盘用 |
+| 附录 E | 自测题 18 问 + 打卡表 | 复盘用 |
 
 ---
 
@@ -86,6 +87,7 @@
 | 服务 | 地址 | 启动脚本 | 数据目录 |
 |------|------|----------|----------|
 | 网关 | http://localhost:8000 | `python main.py` | `logs/` |
+| 网关集群入口 | http://localhost:8080 | `bash scripts/cluster.sh start` | `~/opt/nginx/logs` |
 | Ollama | http://localhost:11434 | 系统服务 `ollama serve` | `~/.ollama` |
 | Prometheus | http://localhost:9090 | `bash scripts/monitoring.sh start` | `~/opt/monitoring/prometheus/data` |
 | Grafana | http://localhost:3000 | 同上 | `~/opt/monitoring/grafana/data` |
@@ -107,6 +109,7 @@
 | 8 | 降级演练 | 逐个 kill 服务，请求仍然 200 |
 | 9 | 自动化验收 + 压测/调优 | `verify_infra.py` 21/21 通过 |
 | 10 | 进阶改造题 | 自己动手做 3 个以上练习 |
+| 11 | 多实例 + nginx 负载均衡 | `verify_cluster.py` 34/34 通过；杀掉一个实例请求仍全部 200 |
 
 **重要心态**：这个项目里最值钱的不是「把 Redis 跑起来」，而是
 **「每一件基础设施都能独立降级，推理主链路永不被拖死」** 这条设计原则。
@@ -1585,6 +1588,397 @@ python tuning_experiment.py --runs 3         # 全扫：ctx + gpu + batch（52 �
 
 ---
 
+## 11. 阶段 11：多实例部署 + nginx 负载均衡
+
+### 11.1 本章目标
+
+学完这一章你能回答：
+
+1. 为什么这个网关「多起几个进程」就能扩并发？状态都藏在哪？
+2. nginx 的 `upstream` 最少要配哪几行？每一行为什么必须这么写？
+3. 怎么用 `curl -i` 一眼看出请求落在哪个实例？（`X-Gateway-Instance`）
+4. 流式输出经过负载均衡会不会被「憋住」？为什么必须 `proxy_buffering off`？
+5. 一个实例挂了，客户端会不会报错？nginx 多久把它摘掉、恢复后多久加回来？
+6. 多实例的指标怎么抓才不会混成一坨？
+
+### 11.2 先想清楚：为什么改个端口就算「扩容」
+
+一个 Web 进程能同时处理的请求数有上限（等待 Ollama 的时间不占 CPU，但连接数、内存、
+单点故障都是天花板）。想让服务更抗打，最直接的办法就是**同一个程序跑多个副本，
+前面放一个调度者把请求分下去** —— 这就是水平扩容。
+
+能不能这么做，取决于一个问题：**进程里有没有「必须唯一」的状态？**
+
+| 状态 | 这个项目放在哪 | 多实例会不会出问题 |
+|------|----------------|--------------------|
+| 限流额度 | Redis（第 5 章） | 若放进程内存，3 个实例 = 额度变成 3 倍 → **必须外置**，本项目已经外置 |
+| 请求历史 | PostgreSQL / SQLite（第 6 章） | 多进程写同一张表 ✓（SQLite 单文件有锁竞争，生产用 PG） |
+| 事件 | Kafka（第 7 章） | 多个生产者写同一 topic，消费者照样按分区读 ✓ |
+| 指标 | 每个实例各自暴露 `/metrics` | **不能**经过负载均衡抓，否则分不清实例（11.11 详解） |
+| 日志 | `GATEWAY_LOG_FILE` 可给每个实例指定独立文件 | 见 `logger.py`；默认仍是 `logs/gateway.log` |
+| 会话 / 对话上下文 | 无（网关不存上下文） | 客户端每次都把 messages 全带上来，天然无状态 ✓ |
+
+**一句话**：正因为第 5~7 章把状态都搬到了外部组件，第 11 章才可能只用「多进程 + 负载均衡」
+就完成扩容。（这也解释了为什么先写基础设施，再写扩容。）
+
+### 11.3 结构长什么样
+
+```
+                        ┌───────────────────┐
+   客户端 ───────────▶  │   nginx  :8080    │  least_conn + 被动健康检查
+                        └─────────┬─────────┘
+              ┌───────────────────┼───────────────────┐
+        ┌─────▼─────┐       ┌─────▼─────┐       ┌─────▼─────┐
+        │  :8000    │       │  :8001    │       │  :8002    │  同一份代码，
+        │gateway-8000      │gateway-8001      │gateway-8002     只有端口/实例名/日志不同
+        └─────┬─────┘       └─────┬─────┘       └─────┬─────┘
+              └───────────────────┼───────────────────┘
+        ┌──────────────┐  ┌───────▼────────┐  ┌──────────────┐
+        │ Redis 限流   │  │ PostgreSQL 历史 │  │ Kafka 事件   │
+        └──────────────┘  └────────────────┘  └──────────────┘
+              ▲ 每个实例各自暴露 /metrics —— Prometheus 直连抓取（不经过 nginx）
+```
+
+对应三个文件（都在仓库里，可直接读）：
+
+| 文件 | 作用 |
+|------|------|
+| `nginx/nginx.conf.tpl` | 负载均衡配置模板（含「为什么这么写」的注释） |
+| `scripts/nginx.sh` | 免 root 安装 nginx + start/stop/reload/test/status/logs |
+| `scripts/cluster.sh` | 起 N 个网关实例并接上 nginx（start / scale / status / logs / stop） |
+
+### 11.4 动手 A：免 root 把 nginx 装上
+
+本机没有 root（`sudo` 要密码）也没有 Docker，所以沿用和 Redis/PostgreSQL 一样的套路：
+**只下载 deb 包，用 `dpkg-deb -x` 解包到自己目录**。
+
+```bash
+bash scripts/nginx.sh install
+# [nginx] apt-get download nginx -> /home/dawson/opt/nginx/downloads
+# [nginx] nginx 安装完成: nginx version: nginx/1.28.3 (Ubuntu)  (/home/dawson/opt/nginx/bin/nginx)
+```
+
+这个 deb 里只有一个二进制（`usr/sbin/nginx`，617 KB），`ldd` 检查过系统库齐全，解包即可用。
+配置、日志、pid、临时目录全部落在 `~/opt/nginx/` 下（不写系统目录）：
+
+```
+~/opt/nginx/
+├── bin/nginx           # 二进制
+├── conf/nginx.conf     # 由 nginx/nginx.conf.tpl 渲染而来（含全部上游实例）
+├── logs/nginx-access.log, nginx-error.log
+├── run/nginx.pid
+└── tmp/                # client_body / proxy 等临时目录
+```
+
+### 11.5 动手 B：一键起 3 个实例 + nginx
+
+```bash
+bash scripts/infra.sh start          # 先确保 Redis / PG / Kafka 在跑（第 5~7 章）
+bash scripts/cluster.sh start
+```
+
+真实输出（本机）：
+
+```
+[cluster] 启动 3 个实例: 端口 8000 8001 8002
+[cluster] 实例 gateway-8000 就绪 (pid=13109, 日志 .../logs/cluster/gateway-8000.log)
+[cluster] 实例 gateway-8001 就绪 (pid=13142, 日志 .../logs/cluster/gateway-8001.log)
+[cluster] 实例 gateway-8002 就绪 (pid=13168, 日志 .../logs/cluster/gateway-8002.log)
+[nginx] 已渲染配置 -> /home/dawson/opt/nginx/conf/nginx.conf（3 个上游: 127.0.0.1:8000,...）
+[nginx] 负载均衡就绪: http://localhost:8080  (健康检查 /lb-health)
+
+--- 网关实例（3 个: 8000 8001 8002 ）---
+  :8000 pid=13109   {"status":"ok","ollama":"up","instance":"gateway-8000","rate_limit_backend":"redis","history_backend":"postgres","kafka_connected":true}
+  :8001 pid=13142   {"status":"ok","ollama":"up","instance":"gateway-8001","rate_limit_backend":"redis","history_backend":"postgres","kafka_connected":true}
+  :8002 pid=13168   {"status":"ok","ollama":"up","instance":"gateway-8002","rate_limit_backend":"redis","history_backend":"postgres","kafka_connected":true}
+--- 负载均衡入口 ---
+nginx lb ok
+--- 经 LB 请求 6 次的实例分布 ---
+  #1 -> gateway-8000
+  #2 -> gateway-8001
+  #3 -> gateway-8002
+  #4 -> gateway-8000
+  #5 -> gateway-8001
+  #6 -> gateway-8002
+```
+
+**看最后六行**：请求被 8000 → 8001 → 8002 → 8000 … 轮流接走，说明负载均衡真的生效了。
+`cluster.sh` 对每个实例只改三样东西：`SERVER_PORT`、`GATEWAY_INSTANCE`、`GATEWAY_LOG_FILE`。
+
+其它子命令：
+
+```bash
+bash scripts/cluster.sh status    # 实例健康 + nginx 上游 + 分发采样
+bash scripts/cluster.sh logs      # 各实例日志末尾 8 行 + nginx 访问日志
+bash scripts/cluster.sh stop      # 先停 nginx，再优雅停各实例
+```
+
+### 11.6 读懂 nginx 配置：每一行为什么必须写
+
+打开 `nginx/nginx.conf.tpl`，核心就三块。**下面这张表是本章最该背下来的部分**：
+
+| 指令 | 值 | 为什么必须是这个值 |
+|------|-----|--------------------|
+| `least_conn` | — | LLM 单请求耗时几秒~几十秒。轮询会把新请求丢给「已经压着几个慢请求」的实例；按**当前连接数最少**分发才均衡 |
+| `max_fails` / `fail_timeout` | `2` / `10s` | 被动健康检查：10 秒内失败 2 次就把上游摘掉，10 秒后再放回来试 |
+| `keepalive 32`<br>+ `proxy_http_version 1.1`<br>+ `proxy_set_header Connection ""` | — | 三行要一起写才能与后端复用长连接（少了 `Connection ""`，HTTP/1.1 默认 `Connection: close`，长连接白配） |
+| `proxy_buffering off` | — | **流式（SSE）的生命线**：开着时 nginx 会攒够缓冲才下发，「逐字输出」变成「等几秒一次性吐出」 |
+| `proxy_request_buffering off` | — | 请求体也不攒内存再转发（长上下文请求体可能不小） |
+| `proxy_read_timeout` / `send_timeout` | `300s` | 默认 60s，LLM 长回答很容易超；不改就会被 nginx 掐断 |
+| `proxy_connect_timeout` | `2s` | 实例已死要**快速失败**，别让客户端陪着等 |
+| `proxy_next_upstream` | `error timeout` | 连接失败/超时时换下一个上游（详见下方「重试的坑」） |
+| `client_max_body_size` | `8m` | 默认 1m，长上下文 + 多轮 messages 可能超 |
+| `worker_processes` / `zone` | `auto` / `64k` | 按 CPU 核数开 worker；`zone` 让多 worker 共享上游健康状态（`least_conn` 的计数也在里面） |
+
+关于**重试**有个容易踩的坑，值得单独说：
+
+> nginx 默认**不会**把「已经发出去的 POST 请求」重试到下一个上游（非幂等，
+> 重试可能让模型把同一个问题答两遍）。所以 `proxy_next_upstream error timeout` 的实际效果是：
+> **连接阶段就失败的请求会换机**（比如实例已经死了、连不上），
+> 而**已经到达后端的请求不会重发**。想强行重试要显式加 `non_idempotent`，
+> 但 LLM 生成场景不建议。这个行为在 11.10 的故障转移实验里能亲眼看到。
+
+模板里还有两条「防误用」配置：
+
+```nginx
+location = /lb-health { return 200 "nginx lb ok\n"; }   # nginx 自己的健康端点，不转发
+location = /metrics   { return 404 "... 请按实例直连抓取 ..."; }   # 见 11.11
+```
+
+### 11.7 动手 C：验证分发（看响应头）
+
+网关给每个响应都加了 `X-Gateway-Instance`（`main.py:317` 非流式 / `main.py:372` 流式）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/v1/chat/completions \
+  -H 'X-API-Key: sk-prod-001' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen0.5b","messages":[{"role":"user","content":"只回复OK"}],"options":{"num_predict":4}}' \
+  | grep -Ei 'HTTP/|x-gateway-instance|x-ratelimit'
+```
+
+```
+HTTP/1.1 200 OK
+x-ratelimit-limit: 60
+x-ratelimit-remaining: 59
+x-ratelimit-reset: 60
+x-gateway-instance: gateway-8000        ← 这次落在 8000；再发几次会看到 8001 / 8002
+```
+
+多打几次，或直接看 nginx 访问日志，能看到「谁接了哪个请求」：
+
+```bash
+tail -5 ~/opt/nginx/logs/nginx-access.log
+# {"time":"...","uri":"/v1/chat/completions","status":200,"request_time":0.31,
+#  "upstream_addr":"127.0.0.1:8001","upstream_status":"200","upstream_time":"0.31",
+#  "instance":"gateway-8001","content_type":"application/json", ...}
+```
+
+这行日志里 `upstream_addr`（转给了谁）、`instance`（后端自报实例名）、
+`request_time` 与 `upstream_time`（客户端总耗时 vs 后端耗时）是排障三件宝。
+日志格式定义在 `nginx/nginx.conf.tpl` 的 `log_format gw ...`（`escape=json` 保证每行都是合法 JSON，
+所以可以直接用 `jq` / `json.loads` 处理）。
+
+### 11.8 动手 D：流式有没有被「憋住」？
+
+这是本章最重要的一次测量。做法：同一台机器上，**经 LB 打一次流式** vs **直连某个实例打一次流式**，
+比较「首字节时间 / 总时长」：
+
+```bash
+# 经 LB（注意 -N 关闭 curl 自己的缓冲）
+curl -s -N -o /dev/null -w '[LB]  ttfb=%{time_starttransfer}s  total=%{time_total}s\n' \
+  -X POST http://localhost:8080/v1/chat/completions \
+  -H 'X-API-Key: sk-prod-001' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen0.5b","messages":[{"role":"user","content":"数到二十"}],"stream":true,"options":{"num_predict":64}}'
+
+# 直连实例（绕开 nginx）
+curl -s -N -o /dev/null -w '[直连] ttfb=%{time_starttransfer}s  total=%{time_total}s\n' \
+  -X POST http://localhost:8000/v1/chat/completions \
+  -H 'X-API-Key: sk-prod-001' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen0.5b","messages":[{"role":"user","content":"数到二十"}],"stream":true,"options":{"num_predict":64}}'
+```
+
+本机实测（`verify_cluster.py` 里的同一项检查）：
+
+```
+经 LB : 首字节 0.033s / 总时长 0.724s
+直连实例: 首字节 0.033s / 总时长 0.155s
+```
+
+首字节完全一致 → nginx 没有额外缓冲。**反证**：把 `proxy_buffering off` 改成 `on`
+再 `bash scripts/nginx.sh reload`，你会发现经 LB 的首字节时间跳到总时长附近
+（缓冲器攒满或上游结束时才下发）。这就是「本地演示一切正常、上线逐字输出失效」的经典原因。
+
+> 小坑（本章踩过）：如果两次请求的 `num_ctx` 不一样，Ollama 会**重载模型**，
+> 首字节会被这次重载拖到 2 秒以上，看起来就像「被 nginx 缓冲了」。
+> 做这种对比实验时，参数必须完全一致。
+
+### 11.9 动手 E：扩容 / 缩容 / 热加载
+
+```bash
+bash scripts/cluster.sh scale 5
+# [cluster] 实例 gateway-8003 就绪 / gateway-8004 就绪
+# [nginx] 已渲染配置 -> ...（5 个上游: 127.0.0.1:8000,...,127.0.0.1:8004）
+# [nginx] 已热加载（worker 平滑重启，连接不中断）
+#   #1 -> gateway-8000 ... #5 -> gateway-8004   ← 5 个实例都在接流量
+
+bash scripts/cluster.sh scale 3
+# [cluster] 停止实例 :8003 / :8004
+```
+
+扩容与缩容的**顺序不一样**，这是设计上的关键：
+
+| 操作 | 顺序 | 为什么 |
+|------|------|--------|
+| 扩容 | 先起新实例 → 再 reload nginx | 新实例没就绪就被加进上游，会白挨几次失败（虽然 `max_fails` 能兜住） |
+| 缩容 | 先改上游并 reload → 再停实例 | 反过来的话，请求还在往要停的实例上打，会出现 502 |
+
+`scale` 还会顺手解决一个现实问题：**每次执行脚本都是新进程**，所以它按 pid 文件推断
+「实际在跑哪几个实例」，而不是盲信环境变量 `CLUSTER_SIZE`（早期版本就是在这里出过 bug：
+`scale 5` 之后再 `scale 3`，多出来的实例没被停掉）。
+
+### 11.10 动手 F：故障转移实验（杀实例）
+
+这是最能体现「负载均衡值不值」的一步。三个终端，或直接看下面实测过的命令序列：
+
+```bash
+# ① 杀掉 8000 这个实例（模拟进程崩溃）
+kill "$(cat logs/cluster/run/gateway-8000.pid)"
+
+# ② 连着打 12 次请求（经 LB）
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w '%{http_code} ' http://localhost:8080/health
+done; echo
+
+# ③ 看 nginx 访问日志里的「换机」证据
+grep -o '"upstream_addr":"[^"]*"' ~/opt/nginx/logs/nginx-access.log | tail -3
+# "upstream_addr":"127.0.0.1:8000, 127.0.0.1:8101"   ← 一次请求先试 8000（死了）再换到别人
+grep -o '"upstream_status":"[^"]*"' ~/opt/nginx/logs/nginx-access.log | tail -3
+# "upstream_status":"502, 200"                       ← 第一次 502（连不上），换机后 200
+
+# ④ 摘除的证据在 error 日志里
+tail -3 ~/opt/nginx/logs/nginx-error.log
+# [error] ... connect() failed (111: Connection refused) while connecting to upstream ...
+# [error] ... upstream server temporarily disabled while connecting to upstream
+```
+
+实测结论（`verify_cluster.py` 第 6 组检查）：
+
+| 观察点 | 结果 |
+|--------|------|
+| 客户端看到的 HTTP 状态 | 12 次**全部 200**（换机对客户端透明） |
+| 响应里的实例名 | 只剩存活的两个实例 |
+| 摘除是否生效 | 后续 8 次请求的访问日志里**没有任何换机痕迹**（不再去连死实例） |
+| 恢复 | 重新拉起实例后，`fail_timeout=10s` 内自动加回上游，**不需要改配置或 reload** |
+
+也就是说：`max_fails=2 / fail_timeout=10s` 让 nginx 在 10 秒内把坏实例摘掉，
+10 秒后再放回来试一次（如果那时候它已经恢复，就自动重新服役）。这就是「被动健康检查」——
+不需要额外部署健康探测服务，代价是故障刚开始的那 1~2 个请求要靠**换机重试**顶住。
+
+### 11.11 多实例下怎么观测（Prometheus 抓取多实例）
+
+每个实例都各自暴露 `/metrics`，所以 Prometheus 应该**直连每个实例**：
+
+```bash
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh start
+# 或已经跑着，只改抓取目标：
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh reload
+bash scripts/monitoring.sh targets    # 看渲染出来的 targets + 当前抓取状态
+```
+
+`monitoring/prometheus.yml` 里的 `targets: ["__GATEWAY_TARGETS__"]` 会在启动/热加载时被
+`monitoring.sh` 渲染成实际列表。**job 名字保持 `llm-gateway` 不变**，所以 Grafana 看板一行都不用改，
+只是曲线里多出几个 `instance`（`localhost:8000` / `localhost:8001` / …）。
+单实例时默认渲染成 `["localhost:8000"]`，行为跟以前完全一样。
+
+实测（发 9 个请求经 LB 后查 Prometheus）：
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=sum%20by%20(instance)(gateway_requests_total)' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); [print(' ', r['metric']['instance'], '=', r['value'][1]) for r in d['data']['result']]"
+#   localhost:8001 = 4
+#   localhost:8000 = 4
+#   localhost:8002 = 3
+```
+
+顺手记住 PromQL 里的两个新玩法：
+
+```promql
+sum by (instance) (rate(gateway_requests_total[1m]))     # 各实例 QPS，一眼看出分得均不均
+count(up{job="llm-gateway"} == 1)                        # 当前有几个实例活着
+```
+
+另外要注意 **`/metrics` 不能走 LB**（模板里显式返回 404 提醒你）：如果经 nginx 抓，
+Prometheus 看到的永远是 LB 那一个地址，3 个实例的样本会被 `instance` 标签糊成一条，
+「某个实例挂了」这种信息直接消失。
+
+### 11.12 动手 G：一键验收 `verify_cluster.py`
+
+```bash
+python verify_cluster.py                  # 34 项检查，约 1 分钟
+python verify_cluster.py --skip-failover  # 不杀实例（不想打断手上的实验时）
+python verify_cluster.py --keep           # 跑完保留实例与 nginx，方便手工接着玩
+```
+
+它会临时拉起 3 个实例（`:8100~:8102`）+ 一个**独立前缀**的 nginx（`:8180`），
+所以不会动你正在跑的 8080 集群；跑完自动清理。检查项分 8 组：
+
+| 组 | 检查什么 |
+|----|----------|
+| 1 | 3 个实例健康（限流/历史/Kafka 后端口径）+ `nginx -t` + `/lb-health` |
+| 2 | 非流式经 LB 成功、`X-Gateway-Instance` 与 `X-RateLimit-*` 透传、12 次分发的均衡度 |
+| 3 | 流式收到 `[DONE]`、内容非空、**首字节/总时长比例 < 80% 且与直连一致**（未被缓冲） |
+| 4 | free 档经 LB 连发 12 次 → 跨 3 个实例只放行 10 次（`200×10 + 429×2`，429 也带实例名） |
+| 5 | 直连数据库看到多个不同 instance（多实例都在写同一张表） |
+| 6 | **故障转移**：杀一个实例 → 客户端仍全 200、日志出现 `502, 200` 换机、后续无换机痕迹（已摘除）、重启后自动加回 |
+| 7 | 每个实例 `/metrics` 直连可抓；经 LB 的 `/metrics` 返回 404 |
+| 8 | nginx 访问日志可逐行解析成 JSON，且出现多个上游/多个实例名 |
+
+本机结果：
+
+```
+验收结果: 34/34 项通过
+```
+
+### 11.13 ✅ 阶段 11 验收清单
+
+- [ ] `bash scripts/nginx.sh install` 成功，`nginx -v` 能看到 1.28.x
+- [ ] `bash scripts/cluster.sh start` 后 3 个实例健康、`/lb-health` 返回 `nginx lb ok`
+- [ ] `curl -i http://localhost:8080/health` 能看到 `x-gateway-instance` 在不同实例间变化
+- [ ] 访问日志里能读到 `upstream_addr` / `upstream_status` / `instance` 三个字段
+- [ ] 经 LB 与直连的流式首字节时间基本相同（证明 `proxy_buffering off` 生效）
+- [ ] free 档经 LB 连发 12 次只放行 10 次（跨实例共享额度）
+- [ ] `bash scripts/cluster.sh scale 5` → 5 个实例都接流量；`scale 3` → 多出来的实例被停掉
+- [ ] 杀掉一个实例，连续请求仍全部 200；error 日志出现 `connect() failed` / `temporarily disabled`
+- [ ] 重新拉起该实例，10 秒内自动回到上游
+- [ ] `GATEWAY_TARGETS=... bash scripts/monitoring.sh reload` 后 Prometheus 有 3 个 UP 的 target
+- [ ] `python verify_cluster.py` → `34/34 项通过`
+
+### 11.14 常见坑
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 起实例时报「端口已被占用」 | 8000 上还跑着单实例网关 | `bash scripts/cluster.sh stop` 或先 `pkill -f 'python main.py'` |
+| 走 LB 的流式「憋住不动，最后一起出来」 | `proxy_buffering` 还是 `on` | 改回 `off` 后 `bash scripts/nginx.sh reload` |
+| 走 LB 的长回答在中途断开 | `proxy_read_timeout` 用了默认 60s | 保持模板里的 300s（客户端 curl 也别忘了 `-m`） |
+| 大 prompt 报 413 | `client_max_body_size` 默认 1m | 模板已设 8m，按需上调 |
+| 杀掉实例后客户端看到 502 | `max_fails` 还没累计够（前 1~2 个请求会失败） | 正常现象；要么等被动摘除，要么给上游加主动健康检查（练习 13） |
+| 缩容后端口还在监听 | 脚本用的实例清单过时 | 本仓库已按 pid 文件推断实况；确认你跑的是最新 `cluster.sh` |
+| Prometheus 里只有一条曲线 | targets 没渲染/仍经 LB 抓 | `bash scripts/monitoring.sh targets` 检查，`reload` 生效 |
+| 改了模板不生效 | nginx 配置是启动时渲染的快照 | `bash scripts/cluster.sh scale <N>`（会重渲染）或 `bash scripts/nginx.sh reload` |
+| 多个实例日志混在一起 | 都写 `logs/gateway.log` | `cluster.sh` 已用 `GATEWAY_LOG_FILE` 分文件；手工起实例时自己加这个环境变量 |
+
+### 11.15 想清楚天花板：单机多实例到底解决了什么
+
+- **解决了**：进程级并发与单点故障。一个进程崩了、重启，用户几乎无感；
+  多核 CPU 上的 Python 单进程瓶颈也被摊开。
+- **没解决**：GPU 只有一块。3 个实例最终还是把请求排到同一个 Ollama 队列里，
+  端到端延迟不会因为实例数变多而下降（第 9 章压测里 `concurrency` 越高 avg 越大，就是这个原因）。
+- **真正的下一步**（第 10 章练习 10 就是这道题）：`OLLAMA_URL` 指向多个 Ollama 实例，
+  在网关内部或再套一层调度（按模型/队列长度选后端），才能让「水平扩容」一路扩到推理层。
+
+> 这也是一句值得记住的工程判断：**负载均衡能消除瓶颈，不能创造算力。**
+> 先测出瓶颈在哪（第 4 章 Grafana + 第 9 章压测），再决定往哪一层加机器。
+
 ## 附录 A：命令速查
 
 ### A.1 启动 / 停止
@@ -1673,9 +2067,39 @@ $KB/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
 
 ```bash
 python verify_infra.py                 # 21 项基础设施验收
+python verify_cluster.py               # 34 项多实例 + 负载均衡验收（含故障转移）
 python load_test.py                    # 并发压测
 python tuning_experiment.py --dry-run  # 看看调优实验计划
 python tuning_experiment.py --sweeps ctx
+```
+
+### A.6 多实例 / 负载均衡（阶段 11）
+
+```bash
+# nginx 负载均衡层（免 root 解包到 ~/opt/nginx）
+bash scripts/nginx.sh install          # 首次安装
+bash scripts/nginx.sh start|stop|restart
+bash scripts/nginx.sh reload           # 改模板 / 增删上游后热加载（不断连接）
+bash scripts/nginx.sh test             # 只做 nginx -t
+bash scripts/nginx.sh status           # 上游健康 + 经 LB 的分发采样
+bash scripts/nginx.sh logs             # tail 访问日志 / 错误日志
+
+# 多实例集群（默认 3 个：8000/8001/8002；入口 nginx :8080）
+bash scripts/cluster.sh start                    # 起实例 + 接上 nginx
+bash scripts/cluster.sh status|logs|stop|restart
+bash scripts/cluster.sh scale 5                  # 扩容到 5（先起实例再 reload）
+bash scripts/cluster.sh scale 3                  # 缩容到 3（先 reload 再停实例）
+CLUSTER_SIZE=4 BASE_PORT=8000 bash scripts/cluster.sh start   # 自定义实例数/起始端口
+WITH_NGINX=0 bash scripts/cluster.sh start       # 只起实例，自己接别的负载均衡
+
+# 看请求落在哪个实例
+curl -s -i http://localhost:8080/health | grep -i x-gateway-instance
+tail -5 ~/opt/nginx/logs/nginx-access.log        # upstream_addr / upstream_status / instance
+
+# 多实例抓取（Prometheus 直连各实例，不经过 LB）
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh start
+GATEWAY_TARGETS=localhost:8000,localhost:8001,localhost:8002 bash scripts/monitoring.sh reload
+bash scripts/monitoring.sh targets                # 看渲染结果与 target 状态
 ```
 
 ---
@@ -1692,17 +2116,21 @@ python tuning_experiment.py --sweeps ctx
 | `events.py` | Kafka 事件生产者 | `EVENT_TYPES` 62；`publish()` 169；降级落盘 228 |
 | `prometheus_metrics.py` | 指标定义 + 记录函数 | 请求类 13~46；质量类 54~72；基础设施类 139~209 |
 | `metrics.py` | GPU 采样 + TTFT/TPS 计算 | `compute_metrics()` 15 |
-| `logger.py` | JSONL 文件日志 | 11 行 |
-| `main.py` | FastAPI 应用与请求链路 | lifespan 72；`_persist` 115；`_parse_options` 164；`_stream_chat` 199；`chat_completions` 294；观测端点 457~510 |
+| `logger.py` | JSONL 文件日志（可用 `GATEWAY_LOG_FILE` 分实例） | 5~9 行 |
+| `main.py` | FastAPI 应用与请求链路 | lifespan 72；`_persist` 115；`_parse_options` 164；`_stream_chat` 199；`chat_completions` 294（实例响应头 317 / 372）；观测端点 461~514 |
 | `tuning_experiment.py` | 参数扫描实验 | 参数 163~170 |
 | `verify_infra.py` | 21 项验收（含双实例对照） | `check()` 43；参数在文件末尾 `main()` |
+| `verify_cluster.py` | 34 项多实例 + 负载均衡验收 | `GatewayInstance` 58；`NginxLB` 103；`check_failover()` 368；`main()` 455 |
 | `load_test.py` | 并发压测 | 21 行 |
 | `scripts/infra.sh` | Redis/PG/Kafka 免 root 部署 | `install_*` 96~175；`start_*`；`cmd_status` 335 |
+| `scripts/cluster.sh` | 多实例集群（起停 / 扩缩容 / 状态） | `running_ports()` 83；`start_instance()` 113；`cmd_scale()` 243 |
+| `scripts/nginx.sh` | nginx 负载均衡层（免 root） | `install_nginx()` 72；`render_config()` 102；`start_nginx()` 139 |
+| `nginx/nginx.conf.tpl` | 负载均衡配置模板 | `upstream` 60~65；`server` 66~120 |
 | `scripts/install_monitoring.sh` | 下载 Prometheus/Grafana | 版本 14~15 |
-| `scripts/monitoring.sh` | 启动监控栈（含 provisioning 渲染） | 环境变量 20~30 |
-| `monitoring/prometheus.yml` | 抓取配置（5s） | 6~26 |
+| `scripts/monitoring.sh` | 启动监控栈（含 provisioning 与 targets 渲染） | 环境变量 24~34；`render_prometheus_config()` 120；`cmd_targets()` 132 |
+| `monitoring/prometheus.yml` | 抓取配置（5s；targets 由 `GATEWAY_TARGETS` 渲染） | 13~26 |
 | `monitoring/grafana/dashboards/llm-gateway.json` | 5 行 35 面板 | row 面板的 `title` |
-| `logs/` | 运行产物 | `gateway.log` / `gateway.db*` / `events.jsonl` / `tuning_*` |
+| `logs/` | 运行产物 | `gateway.log` / `gateway.db*` / `events.jsonl` / `cluster/`（各实例日志与 pid）/ `tuning_*` |
 
 ---
 
@@ -1728,6 +2156,15 @@ python tuning_experiment.py --sweeps ctx
 | `Address already in use` | 端口被占 | `ss -ltnp \| grep <端口>`；或用 `SERVER_PORT=800x` |
 | `/history` 空但请求 200 | 历史没启/还没 flush | `curl /infra` 看 `history.enabled`；等 1 秒 |
 | `database is locked`（SQLite） | 其它进程持锁 | 检查有没有第二个网关进程写同一 db |
+| nginx 启动报 `bind() to 0.0.0.0:8080 failed (98: Address already in use)` | 8080 被占（或上一个 nginx 没退干净） | `bash scripts/nginx.sh stop`；`ss -ltnp \| grep :8080`；换 `LB_PORT=8081` |
+| `nginx: [emerg] open() "/.../logs/nginx-error.log" failed` | 目录/权限问题 | 删掉 `~/opt/nginx` 重跑 `bash scripts/nginx.sh install` |
+| 经 LB 的请求全 502 | 上游实例都没起 | `bash scripts/cluster.sh status`；先 `bash scripts/cluster.sh start` |
+| 经 LB 流式「憋住一次吐出」 | `proxy_buffering` 被改成 `on` | 改回 `off` 后 `bash scripts/nginx.sh reload`（见 11.8） |
+| 经 LB 长回答中途 504 | `proxy_read_timeout` 默认 60s | 模板已设 300s；确认没被改 |
+| `client intended to send too large body` | 请求体超 `client_max_body_size`（默认 1m） | 模板已设 8m，按需上调 |
+| Prometheus 里 3 个实例糊成一条曲线 | 经 LB 抓 `/metrics`（或 `GATEWAY_TARGETS` 只有一个） | 改成 `GATEWAY_TARGETS=localhost:8000,8001,8002` + `monitoring.sh reload` |
+| 集群里每实例限流额度变成 N 倍 | Redis 没起，退化成进程内计数 | `bash scripts/infra.sh start`；`curl :800x/health` 看 `rate_limit_backend=redis` |
+| `scale 5` 后再 `scale 3`，多出来的实例没停 | 旧版脚本以环境变量当实况 | 已改为按 pid 文件推断（`scripts/cluster.sh` 的 `running_ports()`） |
 
 ---
 
@@ -1758,7 +2195,7 @@ python tuning_experiment.py --sweeps ctx
 
 ---
 
-## 附录 E：自测题（做完就能确认自己真的会了）
+## 附录 E：自测题 18 问（做完就能确认自己真的会了）
 
 1. **为什么限流计数要放 Redis，而不是放进程内存？**
    → 多实例时内存计数各记一份，额度被放大成 `实例数 × 配额`；Redis 让所有实例共享一份。
@@ -1790,6 +2227,15 @@ python tuning_experiment.py --sweeps ctx
     → 小模型要么全放 GPU（`-1`）要么纯 CPU；半 offload 最差。
 15. **为什么改 `num_ctx` 会看到 TTFT 尖峰？**
     → 参数变化触发 Ollama 重载模型（冷启动 ≈ 2.1s）。
+16. **为什么这个网关能靠「多起几个进程」扩容？**
+    → 进程本身无状态：限流额度在 Redis、历史在 PG、事件在 Kafka；
+    唯一要注意的是 `/metrics` 必须按实例直连抓，不能经过负载均衡。
+17. **nginx 里哪三行必须一起写才能与后端复用长连接？流式为什么必须 `proxy_buffering off`？**
+    → `keepalive 32` + `proxy_http_version 1.1` + `proxy_set_header Connection ""`；
+    `proxy_buffering on` 会攒够缓冲才下发，SSE 的「逐字输出」变成「一次性吐出」。
+18. **杀掉一个实例后，客户端为什么还能全 200？多久把它摘掉？**
+    → `proxy_next_upstream error timeout` 在连接失败时换到下一个上游；
+    `max_fails=2 / fail_timeout=10s` 决定 10 秒内失败 2 次就摘除、10 秒后自动放回来试。
 
 ### 学习打卡表
 
@@ -1805,6 +2251,7 @@ python tuning_experiment.py --sweeps ctx
 | 8 | 降级演练 | ☐ | |
 | 9 | verify_infra 21/21 + 压测 + 调优 | ☐ | |
 | 10 | 进阶练习（≥3 题） | ☐ | |
+| 11 | 多实例 + nginx 负载均衡（verify_cluster 34/34 + 故障转移） | ☐ | |
 
 ---
 

@@ -2093,7 +2093,13 @@ CLUSTER_SIZE=4 BASE_PORT=8000 bash scripts/cluster.sh start   # 自定义实例�
 WITH_NGINX=0 bash scripts/cluster.sh start       # 只起实例，自己接别的负载均衡
 
 # 看请求落在哪个实例
-curl -s -i http://localhost:8080/health | grep -i x-gateway-instance
+# （聊天接口给每个响应都带 X-Gateway-Instance 响应头）
+curl -sD - -o /dev/null -X POST http://localhost:8080/v1/chat/completions \
+  -H 'X-API-Key: sk-test-001' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen0.5b","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":2}}' \
+  | grep -i x-gateway-instance
+# 观测端点 /health 不带该响应头，但 JSON body 里有 instance 字段
+curl -s http://localhost:8080/health        # {"status":"ok",...,"instance":"gateway-8001",...}
 tail -5 ~/opt/nginx/logs/nginx-access.log        # upstream_addr / upstream_status / instance
 
 # 多实例抓取（Prometheus 直连各实例，不经过 LB）
